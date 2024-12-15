@@ -1,0 +1,15 @@
+{
+  "recommendations": [
+    "aaron-bond.better-comments",
+    "christian-kohler.path-intellisense",
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode",
+    "Gruntfuggly.todo-tree",
+    "naumovs.color-highlight",
+    "kisstkondoros.vscode-gutter-preview",
+    "eamodio.gitlens",
+    "yzhang.markdown-all-in-one",
+    "mikestead.dotenv",
+    "ms-azuretools.vscode-docker"
+  ]
+}

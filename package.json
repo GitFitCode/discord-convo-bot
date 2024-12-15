@@ -1,0 +1,41 @@
+{
+  "name": "discord-convo-bot",
+  "version": "0.1.0",
+  "description": "Discord conversation bot for GitFitCode needs, written in TypeScript.",
+  "scripts": {
+    "build": "tsc -p tsconfig.production.json",
+    "clear-commands": "pnpm build && node ./dist/src/scripts/clearRegisteredCommands.js",
+    "clear-events": "pnpm build && node ./dist/src/scripts/clearScheduledEvents.js",
+    "dev": "pnpm i && ts-node ./src/index.ts",
+    "lint": "eslint .",
+    "pm2": "pnpm build && pm2 start ./dist/src/index.js --name discord-convo-bot",
+    "pre-build": "rm -rf ./dist",
+    "prepare": "husky",
+    "start": "node ./dist/src/index.js",
+    "test": "echo 'No tests yet'."
+  },
+  "author": "GitFitCode",
+  "license": "GNU GPLv3",
+  "dependencies": {
+    "discord.js": "latest",
+    "dotenv": "latest"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "latest",
+    "@commitlint/config-conventional": "latest",
+    "@types/node": "latest",
+    "@typescript-eslint/eslint-plugin": "latest",
+    "@typescript-eslint/parser": "latest",
+    "eslint": "latest",
+    "eslint-config-airbnb-base": "latest",
+    "eslint-config-airbnb-typescript": "latest",
+    "husky": "latest",
+    "ts-node": "latest",
+    "tslib": "latest",
+    "typescript": "latest"
+  },
+  "engines": {
+    "node": "22.x",
+    "pnpm": "9.x"
+  }
+}
