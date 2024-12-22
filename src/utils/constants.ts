@@ -17,3 +17,15 @@ export const COMMAND_INFO = {
   COMMAND_NAME: 'info',
   COMMAND_DESCRIPTION: 'Displays info about yourself and the server.',
 };
+
+// Join command constants
+export const COMMAND_JOIN = {
+  COMMAND_NAME: 'join',
+  COMMAND_DESCRIPTION: 'Joins the voice channel you are currently in.',
+};
+
+// Leave command constants
+export const COMMAND_LEAVE = {
+  COMMAND_NAME: 'leave',
+  COMMAND_DESCRIPTION: 'Leaves the voice channel you are currently in.',
+};

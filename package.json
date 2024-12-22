@@ -17,6 +17,7 @@
   "author": "GitFitCode",
   "license": "GNU GPLv3",
   "dependencies": {
+    "@discordjs/voice": "^0.18.0",
     "discord.js": "latest",
     "dotenv": "latest"
   },
