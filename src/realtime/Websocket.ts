@@ -4,7 +4,9 @@ import {
   EndBehaviorType,
   createAudioResource,
   AudioPlayer,
+  StreamType,
 } from '@discordjs/voice';
+import { Readable } from 'stream';
 import WebSocket from 'ws';
 
 async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
@@ -21,7 +23,6 @@ async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
 
   receiver.speaking.on('start', (userId: string) => {
     console.log(`User ${userId} started speaking.`);
-
     // Get the audio stream for the user
     const audioStream = receiver.subscribe(userId, {
       end: {
@@ -29,7 +30,6 @@ async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
         duration: 2000,
       },
     });
-
     audioStream.on('data', (chunk: Buffer) => {
       console.log(`Streaming audio data for user ${userId}`);
       // Send this event to append audio bytes to the input audio buffer. The audio buffer is temporary storage you can write to and later commit
@@ -38,9 +38,7 @@ async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
         type: "input_audio_buffer.append",
         audio: chunk.toString('base64'),
       }))
-
     });
-
     audioStream.on('end', () => {
       console.log(`User ${userId} stopped speaking. Audio stream ended.`);
     });
@@ -60,22 +58,43 @@ async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
     return;
   }
 
-  // /**
-  //  * Socket Events
-  //  */
-  // ws.on('open', () => {
-  //   console.log('Connected to OpenAI Realtime API');
-  // });
+  // Create a single Readable stream for continuous audio
+  const audioStream = new Readable({
+    read() {}, // No-op; data will be pushed into the stream
+  });
+  // Audio resource from audio stream 
+  const audioResource = createAudioResource(audioStream, { inputType: StreamType.Raw });
+  // Start playback of the audio resource
+  audioPlayer.play(audioResource);
 
-  // /// When receiving messages from OpenAI
+  //////////////////
+  // WebSocket Events
+  //////////////////
+
+  // When the WebSocket connection is established
+  ws.on('open', () => {
+    console.log('Connected to OpenAI Realtime API');
+  });
+
+  // When receiving messages from OpenAI
   ws.on('message', (data: any) => {
-    handleResponseData(ws, data, audioPlayer);
+    handleResponseData(ws, data, audioPlayer, audioStream);
+  });
+  // When the WebSocket connection is closed
+  ws.on('close', () => {
+    console.log('Connection to OpenAI Realtime API closed');
+    audioStream.push(null); // Finalize the audio stream
   });
 }
 
 export default RealtimeWebsocket;
 
-async function handleResponseData(ws: WebSocket, messageStr: string, audioPlayer: AudioPlayer) {
+async function handleResponseData(
+  ws: WebSocket, 
+  messageStr: string, 
+  audioPlayer: AudioPlayer,
+  audioStream: Readable
+) {
   const message = JSON.parse(messageStr);
   // Define what happens when a message is received
   switch (message.type) {
@@ -97,22 +116,26 @@ async function handleResponseData(ws: WebSocket, messageStr: string, audioPlayer
       // Returned when an input audio buffer is committed, either by the client or automatically in server VAD mode. The item_id property is the ID of the user message item that will be created, thus a conversation.item.created event will also be sent to the client.
       console.log('Ai has taken in the audio data');
       break;
-
+    //////////////////
     // AUDIO RESPONSES
+    //////////////////
     case 'response.audio.delta':
       // TODO: Handle audio data
       // Audio chunk received from OpenAI
       const base64AudioChunk = message.delta;
-      // const audioBuffer = Buffer.from(base64AudioChunk, "base64");
-      const resource = createAudioResource(audioBuffer, { inputType: 'raw' });
+      const audioBuffer = Buffer.from(base64AudioChunk, "base64");
+      audioStream.push(audioBuffer);
+      // const resource = createAudioResource(audioBuffer, { inputType: 'raw' });
       break;
     case 'response.audio.done':
       // speaker.end();
       console.log('Ai has finished responding')
+      audioStream.push(null);
       ws.close();
       break;
-
+    //////////////////
     // TEXT RESPONSES 
+    //////////////////
     case 'response.text.delta':
       // We got a new text chunk, print it
       process.stdout.write(message.delta);
@@ -132,28 +155,28 @@ async function handleResponseData(ws: WebSocket, messageStr: string, audioPlayer
   }
 }
 
-async function handleStartConversation(ws: WebSocket, chunk: Buffer) {
-  const createConversationEvent = {
-    type: 'conversation.item.create',
-    item: {
-      type: 'message',
-      role: 'user',
-      content: [
-        {
-          type: 'input_audio',
-          // TODO: Replace with actual audio data from the user
-          // audio: base64AudioData,
-        },
-      ],
-    },
-  };
-  ws.send(JSON.stringify(createConversationEvent));
-  const createResponseEvent = {
-    type: 'response.create',
-    response: {
-      modalities: ['text', 'audio'],
-      instructions: 'Please assist the user.',
-    },
-  };
-  ws.send(JSON.stringify(createResponseEvent));
-}
+// async function handleStartConversation(ws: WebSocket, chunk: Buffer) {
+//   const createConversationEvent = {
+//     type: 'conversation.item.create',
+//     item: {
+//       type: 'message',
+//       role: 'user',
+//       content: [
+//         {
+//           type: 'input_audio',
+//           // TODO: Replace with actual audio data from the user
+//           // audio: base64AudioData,
+//         },
+//       ],
+//     },
+//   };
+//   ws.send(JSON.stringify(createConversationEvent));
+//   const createResponseEvent = {
+//     type: 'response.create',
+//     response: {
+//       modalities: ['text', 'audio'],
+//       instructions: 'Please assist the user.',
+//     },
+//   };
+//   ws.send(JSON.stringify(createResponseEvent));
+// }
