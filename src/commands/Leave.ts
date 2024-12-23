@@ -45,10 +45,8 @@ async function executeRun(client: Client, interaction: CommandInteraction) {
   connection.destroy();
 
 	// Success message
-  await interaction.reply({
-    content: `Left **${channelName}**.`,
-    ephemeral: false, // Set to true if you want only the user to see this message
-  });
+  await interaction.editReply(`Left **${channelName}**.`);
+  console.log(`convobot left **${channelName}**.`)
 }
 
 const Leave: SlashCommand = {

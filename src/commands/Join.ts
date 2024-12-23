@@ -1,13 +1,14 @@
 /**
  * Slash command that joins the voice channel of the user who triggered the command.
  *
- * To trigger, type `/chat` in the Discord server.
+ * To trigger, type `/join` in the Discord server.
  */
-
 import { CommandInteraction, Client } from 'discord.js';
-import { joinVoiceChannel } from '@discordjs/voice';
+import { joinVoiceChannel} from '@discordjs/voice';
 import { SlashCommand } from '../Command';
 import { COMMAND_JOIN } from '../utils';
+import RealtimeWebsocket from '../realtime/Websocket';
+
 
 async function executeRun(client: Client, interaction: CommandInteraction) {
   // Make sure we are in a guild
@@ -21,7 +22,6 @@ async function executeRun(client: Client, interaction: CommandInteraction) {
 
   // Identify the user’s voice channel
   const member = interaction.guild.members.cache.get(interaction.user.id);
-
   const voiceChannel = member?.voice?.channel;
   if (!voiceChannel) {
     await interaction.editReply('You need to join a voice channel first!');
@@ -29,22 +29,32 @@ async function executeRun(client: Client, interaction: CommandInteraction) {
   }
 
   // Join the voice channel
-  joinVoiceChannel({
+  const voiceChannelConnection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: interaction.guild.id,
     adapterCreator: interaction.guild.voiceAdapterCreator,
+    selfDeaf: false,
   });
 
   // Success message
   await interaction.editReply(`Joined **${voiceChannel.name}**!`);
+
+  try {
+    console.log('Starting the realtime websocket');
+    await interaction.editReply(`Starting the realtime websocket...`);
+    RealtimeWebsocket(voiceChannelConnection);
+  } catch (error) {
+    console.log('Error starting the realtime websocket:', error);
+    await interaction.editReply(`Error starting the realtime websocket: ${error}`);
+  }
 }
 
-const Chat: SlashCommand = {
+const Join: SlashCommand = {
   name: COMMAND_JOIN.COMMAND_NAME,
   description: COMMAND_JOIN.COMMAND_DESCRIPTION,
   run: async (_client: Client, interaction: CommandInteraction) => {
-    await executeRun(_client,interaction);
+    await executeRun(_client, interaction);
   },
 };
 
-export default Chat;
+export default Join;
