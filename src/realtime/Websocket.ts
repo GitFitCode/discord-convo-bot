@@ -21,7 +21,7 @@ function resampleAudio(inputStream: PassThrough): PassThrough {
 
   ffmpeg(inputStream)
     .inputOptions(['-f s16le', '-ar 24000', '-ac 1']) // Input: PCM16 mono 24 kHz
-    .outputOptions(['-f s16le', '-ar 48000', '-ac 1']) // Output: PCM16 mono 48 kHz
+    .outputOptions(['-f s16le', '-ar 96000', '-ac 1']) // Output: PCM16 mono 48 kHz
     .on('start', (commandLine) => {
       console.log('FFmpeg command:', commandLine);
     })
