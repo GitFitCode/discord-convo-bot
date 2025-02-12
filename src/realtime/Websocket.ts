@@ -14,7 +14,14 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import WebSocket from 'ws';
 import TranscriptionClient from './WhisperClient';
-import utils from './utils';
+import { TranscriptManager } from './TranscriptManager';
+import { writeFileSync } from 'fs';
+
+// Global variables for handling AI audio response streaming.
+let currentPassThrough: PassThrough | null = null;
+let currentResource: AudioResource | null = null;
+
+const transcriptManager = new TranscriptManager();
 
 interface UserSession {
   stream: PassThrough; // Audio stream for processing
@@ -54,45 +61,82 @@ function resampleAudio(inputStream: PassThrough): PassThrough {
 }
 
 /**
- * Subscribes to a user's audio stream from Discord.
- * Decodes from Opus to PCM (24kHz), then base64-encodes,
- * and queues the data for sending to OpenAI.
+ * Subscribes to the user's audio stream, encodes it, and sends it to the WebSocket.
  */
 function subscribeToUserAudio(
   userId: string,
   receiver: VoiceConnection['receiver'],
   opusEncoder: OpusEncoder,
   ws: WebSocket,
-  audioQueue: string[],
+  audioQueue: string[]
 ) {
-  console.log(`User ${userId} started speaking.`);
-  const userAudioStream = receiver.subscribe(userId, {
+  const audioStream = receiver.subscribe(userId, {
     end: {
-      behavior: EndBehaviorType.AfterInactivity,
-      duration: 3000,
+      behavior: EndBehaviorType.AfterSilence,
+      duration: 100,
     },
   });
 
-  userAudioStream.on('data', (chunk: Buffer) => {
-    const decodedPCM = opusEncoder.decode(chunk);
-    const encodedBase64 = Buffer.from(decodedPCM).toString('base64');
+  const passThroughStream = new PassThrough();
+  const resampledStream = resampleAudio(passThroughStream);
 
-    if (ws.readyState === WebSocket.OPEN) {
-      audioQueue.push(encodedBase64);
-    } else {
-      console.error('WebSocket is not open. Cannot send audio data.');
+  audioStream.pipe(passThroughStream);
+
+  resampledStream.on('data', (chunk) => {
+    try {
+      // Process smaller chunks to avoid buffer size issues
+      const chunkSize = 1024; // Adjust the chunk size as needed
+      for (let i = 0; i < chunk.length; i += chunkSize) {
+        const smallChunk = chunk.slice(i, i + chunkSize);
+        const encodedAudio = opusEncoder.encode(smallChunk);
+        const base64Audio = encodedAudio.toString('base64');
+        audioQueue.push(base64Audio);
+      }
+    } catch (error) {
+      console.error(`Error encoding audio chunk for user ${userId}:`, error);
     }
   });
 
-  userAudioStream.on('end', () => {
-    console.log(`User ${userId} stopped speaking. Audio stream ended.`);
+  resampledStream.on('end', () => {
+    console.log(`Audio stream for user ${userId} ended.`);
   });
+
+  resampledStream.on('error', (error) => {
+    console.error(`Error in audio stream for user ${userId}:`, error);
+  });
+}
+
+
+/**
+ * Flushes the audio queue by sending combined audio data over the WebSocket.
+ */
+function flushAudioQueue(ws: WebSocket, audioQueue: string[]) {
+  if (ws.readyState !== WebSocket.OPEN) {
+    console.error('WebSocket is not open. Cannot flush audio data.');
+    // return;
+  }
+  if (audioQueue.length === 0) {
+    console.log('No audio data to flush.');
+    // return;
+  }
+  const combinedAudio = audioQueue.join('');
+  ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: combinedAudio }));
+  audioQueue.length = 0;
+}
+
+/**
+ * Sets up a periodic timer to flush the audio queue.
+ */
+function setupFlushTimer(ws: WebSocket, audioQueue: string[], flushIntervalMs: number) {
+  return setInterval(() => {
+    flushAudioQueue(ws, audioQueue);
+  }, flushIntervalMs);
 }
 
 /**
  * Main function to handle realtime WebSocket processing.
  */
-async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
+export default async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
   // Voice receiver from the voice connection.
   const { receiver } = voiceChannelConnection;
   // Create an Opus encoder to convert Discord’s 48kHz audio to 24kHz PCM.
@@ -106,118 +150,91 @@ async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
     },
   });
 
-  // Set up a queue and flush timer for throttled sending of audio data.
+  // Create a queue for storing base64-encoded user audio.
   const audioQueue: string[] = [];
-  let flushTimer: NodeJS.Timeout | null = null;
-  const flushInterval = 100; // flush every 100ms
-
-  /**
-   * Receiver events: triggered when a user starts or stops speaking.
-   */
-  receiver.speaking.on('start', (userId: string) => {
-    console.log(`User ${userId} started speaking.`);
-    // Subscribe to the user's audio stream.
-    const userAudioStream = receiver.subscribe(userId, {
-      end: {
-        behavior: EndBehaviorType.AfterInactivity,
-        duration: 3000,
-      },
-    });
-
-    userAudioStream.on('data', (chunk: Buffer) => {
-      const decodedPM = opus24kEncoder.decode(chunk);
-      const encodedBase64 = Buffer.from(decodedPM).toString('base64');
-
-      if (ws.readyState === WebSocket.OPEN) {
-        // Instead of sending each chunk immediately, push the chunk to the queue.
-        audioQueue.push(encodedBase64);
-        // Start a flush timer if one is not already running.
-        if (!flushTimer) {
-          flushTimer = setTimeout(() => {
-            const combinedAudio = audioQueue.join('');
-            ws.send(
-              JSON.stringify({
-                type: 'input_audio_buffer.append',
-                audio: combinedAudio,
-              }),
-            );
-            audioQueue.length = 0;
-            flushTimer = null;
-          }, flushInterval);
-        }
-      } else {
-        console.error('WebSocket is not open. Cannot send audio data.');
-      }
-    });
-    userAudioStream.on('end', () => {
-      console.log(`User ${userId} stopped speaking. Audio stream ended.`);
-    });
-  });
-
-  receiver.speaking.on('end', (userId: string) => {
-    console.log(`User ${userId} finished speaking. Receiver ended.`);
-  });
+  const flushIntervalMs = 1000;
+  const flushIntervalId = setupFlushTimer(ws, audioQueue, flushIntervalMs);
 
   /**
    * Audio player: used to play AI audio responses on Discord.
    */
   const audioPlayer: AudioPlayer = createAudioPlayer();
-  const subscription = voiceChannelConnection.subscribe(audioPlayer);
-  if (!subscription) {
-    console.error('Failed to subscribe to the voice channel.');
-    return;
-  }
+
+  // Attach audio player event listeners.
+  audioPlayer.on(AudioPlayerStatus.Playing, () => {
+    console.log('Audio player is now playing AI voice.');
+  });
+  audioPlayer.on('stateChange', (oldState, newState) => {
+    console.log(`Audio player transitioned from ${oldState.status} to ${newState.status}`);
+  });
+  audioPlayer.on(AudioPlayerStatus.Idle, () => {
+    console.log('Audio player is idle; flushing audio queue...');
+    flushAudioQueue(ws, audioQueue);
+  });
+
+  voiceChannelConnection.subscribe(audioPlayer);
+
   /**
    * WebSocket events for realtime data from OpenAI.
    */
   ws.on('open', () => {
     console.log('Connected to OpenAI Realtime API');
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: 'session.update',
-          session: {
-            modalities: ['text', 'audio'],
-            instructions: 'You are a helpful assistant.',
-            voice: 'alloy',
-            input_audio_format: 'pcm16',
-            output_audio_format: 'pcm16',
-            input_audio_transcription: {
-              model: 'whisper-1',
-            },
-            turn_detection: {
-              type: 'server_vad',
-              threshold: 0.4,
-              prefix_padding_ms: 200,
-              silence_duration_ms: 400,
-              create_response: true,
-            },
-            temperature: 0.8,
-            max_response_output_tokens: 'inf',
+    ws.send(
+      JSON.stringify({
+        type: 'session.update',
+        session: {
+          modalities: ['text', 'audio'],
+          instructions: 'You are a helpful assistant.',
+          voice: 'alloy',
+          input_audio_format: 'pcm16',
+          output_audio_format: 'pcm16',
+          input_audio_transcription: {
+            model: 'whisper-1',
           },
-        }),
-      );
-    } else {
-      console.error('WebSocket is not open. Cannot send audio data.');
-    }
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.4,
+            prefix_padding_ms: 200,
+            silence_duration_ms: 400,
+            create_response: true,
+          },
+          temperature: 0.8,
+          max_response_output_tokens: 'inf',
+        },
+      }),
+    );
   });
 
   ws.on('message', (data: any) => {
     handleMessage(ws, data, audioPlayer);
   });
+
   ws.on('close', () => {
-    console.log('Connection to OpenAI Realtime API closed');
+    console.log('OpenAI WebSocket closed.');
+    clearInterval(flushIntervalId);
+    const srtContent = transcriptManager.toSRT();
+    try {
+      writeFileSync('output.srt', srtContent, { encoding: 'utf-8' });
+    } catch (e) {
+      console.log(e);
+    }
+    process.exit(0);
+  });
+
+  receiver.speaking.on('start', (userId: string) => {
+    subscribeToUserAudio(userId, receiver, opus24kEncoder, ws, audioQueue);
+    // Start a new transcript segment for this user.
+    transcriptManager.addDelta(userId, '', Date.now());
+  });
+
+  receiver.speaking.on('end', (userId: string) => {
+    console.log(`User ${userId} finished speaking (receiver ended).`);
+    transcriptManager.commitSegment(userId, Date.now());
   });
 }
 
-export default RealtimeWebsocket;
-
-// Global variables for handling AI audio response streaming.
-let currentPassThrough: PassThrough | null = null;
-let currentResource: AudioResource | null = null;
-
-async function handleMessage(ws: WebSocket, messageStr: string, audioPlayer: AudioPlayer) {
-  const message = JSON.parse(messageStr);
+async function handleMessage(ws: WebSocket, data: any, audioPlayer: AudioPlayer) {
+  const message = JSON.parse(data.toString());
   switch (message.type) {
     case 'session.created':
       console.log('Connection to OpenAI has been established');
@@ -233,6 +250,7 @@ async function handleMessage(ws: WebSocket, messageStr: string, audioPlayer: Aud
       break;
     case 'conversation.item.input_audio_transcription.completed':
       console.log('Transcription completed');
+      transcriptManager.commitSegment('user', Date.now());
       console.log(message);
       break;
     case 'input_audio_buffer.speech_started':
@@ -252,13 +270,6 @@ async function handleMessage(ws: WebSocket, messageStr: string, audioPlayer: Aud
           inputType: StreamType.Raw,
         });
         audioPlayer.play(currentResource);
-
-        audioPlayer.on(AudioPlayerStatus.Playing, () => {
-          console.log('Now playing AI voice (new response).');
-        });
-        audioPlayer.on('stateChange', (oldState, newState) => {
-          console.log(`Audio player transitioned from ${oldState.status} to ${newState.status}`);
-        });
       }
       const base64AudioChunk = message.delta;
       const audioBuffer = Buffer.from(base64AudioChunk, 'base64');
@@ -267,10 +278,10 @@ async function handleMessage(ws: WebSocket, messageStr: string, audioPlayer: Aud
     }
     case 'response.audio.done': {
       console.log('AI finished responding (audio).');
-      if (currentPassThrough && !currentPassThrough.destroyed) {
+      if (currentPassThrough) {
         currentPassThrough.end();
+        currentPassThrough = null;
       }
-      currentPassThrough = null;
       currentResource = null;
       break;
     }
@@ -278,6 +289,21 @@ async function handleMessage(ws: WebSocket, messageStr: string, audioPlayer: Aud
       console.log('AI encountered an error:', message.error);
       ws.close();
       break;
+    default:
+      console.debug('unhandled message type', message.type, message);
+      break;
   }
-  
 }
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received. Flushing audio queue and writing transcript...');
+  // Assuming ws and flushIntervalId are in scope or stored globally:
+  // (You may need to adapt this if these variables are local.)
+  // For this example, we assume the WebSocket will close and its 'close' handler will run.
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Flushing audio queue and writing transcript...');
+  process.exit(0);
+});

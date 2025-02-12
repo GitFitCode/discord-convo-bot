@@ -18,6 +18,12 @@ export const COMMAND_INFO = {
   COMMAND_DESCRIPTION: 'Displays info about yourself and the server.',
 };
 
+// Info command constants
+export const COMMAND_TRANSCRIBE = {
+  COMMAND_NAME: 'transcribe',
+  COMMAND_DESCRIPTION: 'Transcribes all voice channel audio to text.',
+};
+
 // Join command constants
 export const COMMAND_JOIN = {
   COMMAND_NAME: 'join',
