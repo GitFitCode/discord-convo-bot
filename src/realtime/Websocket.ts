@@ -13,15 +13,32 @@ import { PassThrough, Readable } from 'stream';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import WebSocket from 'ws';
+import TranscriptionClient from './WhisperClient';
+import utils from './utils';
+
+interface UserSession {
+  stream: PassThrough; // Audio stream for processing
+  websocket: WebSocket; // WebSocket connection to OpenAI
+  audioPlayer: AudioPlayer; // Discord audio player
+  currentPassThrough: PassThrough | null; // For streaming AI audio response
+  currentResource: AudioResource | null;
+  // The audio resource created from currentPassThrough
+  transcriptionClient: TranscriptionClient; // Per-user transcription client instance
+}
+
+// const activeUsers = new Map<string, UserSession>();
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
+/**
+ * Resample the input audio stream.
+ */
 function resampleAudio(inputStream: PassThrough): PassThrough {
   const resampledStream = new PassThrough();
 
   ffmpeg(inputStream)
     .inputOptions(['-f s16le', '-ar 24000', '-ac 1']) // Input: PCM16 mono 24 kHz
-    .outputOptions(['-f s16le', '-ar 96000', '-ac 1']) // Output: PCM16 mono 48 kHz
+    .outputOptions(['-f s16le', '-ar 48000', '-ac 2']) // Output: PCM16 mono 48 kHz
     .on('start', (commandLine) => {
       console.log('FFmpeg command:', commandLine);
     })
@@ -36,50 +53,98 @@ function resampleAudio(inputStream: PassThrough): PassThrough {
   return resampledStream;
 }
 
+/**
+ * Subscribes to a user's audio stream from Discord.
+ * Decodes from Opus to PCM (24kHz), then base64-encodes,
+ * and queues the data for sending to OpenAI.
+ */
+function subscribeToUserAudio(
+  userId: string,
+  receiver: VoiceConnection['receiver'],
+  opusEncoder: OpusEncoder,
+  ws: WebSocket,
+  audioQueue: string[],
+) {
+  console.log(`User ${userId} started speaking.`);
+  const userAudioStream = receiver.subscribe(userId, {
+    end: {
+      behavior: EndBehaviorType.AfterInactivity,
+      duration: 3000,
+    },
+  });
 
+  userAudioStream.on('data', (chunk: Buffer) => {
+    const decodedPCM = opusEncoder.decode(chunk);
+    const encodedBase64 = Buffer.from(decodedPCM).toString('base64');
+
+    if (ws.readyState === WebSocket.OPEN) {
+      audioQueue.push(encodedBase64);
+    } else {
+      console.error('WebSocket is not open. Cannot send audio data.');
+    }
+  });
+
+  userAudioStream.on('end', () => {
+    console.log(`User ${userId} stopped speaking. Audio stream ended.`);
+  });
+}
+
+/**
+ * Main function to handle realtime WebSocket processing.
+ */
 async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
-  // Voice receiver
+  // Voice receiver from the voice connection.
   const { receiver } = voiceChannelConnection;
-  // Opus Encoder: Used to to encode 48khz audio input from discord
-  // to 24khz audio forOpenAI
+  // Create an Opus encoder to convert Discord’s 48kHz audio to 24kHz PCM.
   const opus24kEncoder = new OpusEncoder(24000, 1);
-  // Start WebSocket connection to OpenAI Realtime API
+  // Start a WebSocket connection to OpenAI.
   const ai_model_url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
   const ws = new WebSocket(ai_model_url, {
     headers: {
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       'OpenAI-Beta': 'realtime=v1',
     },
   });
 
+  // Set up a queue and flush timer for throttled sending of audio data.
+  const audioQueue: string[] = [];
+  let flushTimer: NodeJS.Timeout | null = null;
+  const flushInterval = 100; // flush every 100ms
+
   /**
-   * Receiver events
-   *
-   * These events are triggered when a user in the voice channel starts or stops speaking.
+   * Receiver events: triggered when a user starts or stops speaking.
    */
   receiver.speaking.on('start', (userId: string) => {
     console.log(`User ${userId} started speaking.`);
-    // Get the audio stream for the user
+    // Subscribe to the user's audio stream.
     const userAudioStream = receiver.subscribe(userId, {
       end: {
         behavior: EndBehaviorType.AfterInactivity,
-        duration: 2000,
+        duration: 3000,
       },
     });
+
     userAudioStream.on('data', (chunk: Buffer) => {
-      // console.log(Streaming audio data for user ${userId});
-      // Send this event to append audio bytes to the input audio buffer. The audio buffer is temporary storage you can write to and later commit
-      // Note: By default, Realtime sessions have voice activity detection (VAD) enabled, which means the API will determine when the user has started or stopped speaking, and automatically start to respond.
       const decodedPM = opus24kEncoder.decode(chunk);
       const encodedBase64 = Buffer.from(decodedPM).toString('base64');
 
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: encodedBase64,
-          }),
-        );
+        // Instead of sending each chunk immediately, push the chunk to the queue.
+        audioQueue.push(encodedBase64);
+        // Start a flush timer if one is not already running.
+        if (!flushTimer) {
+          flushTimer = setTimeout(() => {
+            const combinedAudio = audioQueue.join('');
+            ws.send(
+              JSON.stringify({
+                type: 'input_audio_buffer.append',
+                audio: combinedAudio,
+              }),
+            );
+            audioQueue.length = 0;
+            flushTimer = null;
+          }, flushInterval);
+        }
       } else {
         console.error('WebSocket is not open. Cannot send audio data.');
       }
@@ -93,38 +158,53 @@ async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
     console.log(`User ${userId} finished speaking. Receiver ended.`);
   });
 
-
-    /**
-   * Audio player
-   *
-   * Used to play audio data onto discord
+  /**
+   * Audio player: used to play AI audio responses on Discord.
    */
-  // Create an audio player
   const audioPlayer: AudioPlayer = createAudioPlayer();
-  // Subscribe the connection to the audio player (will play audio on the voice connection)
-  // - Attaches audioplayer to active voice channel
   const subscription = voiceChannelConnection.subscribe(audioPlayer);
-  // Ensure we handle subscription lifecycle
   if (!subscription) {
     console.error('Failed to subscribe to the voice channel.');
     return;
   }
-
   /**
-   * Websocket events
-   *
-   * Events triggered by webscoket connection that enable realtime capture of data from api
+   * WebSocket events for realtime data from OpenAI.
    */
-  // When the WebSocket connection is established
   ws.on('open', () => {
     console.log('Connected to OpenAI Realtime API');
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'session.update',
+          session: {
+            modalities: ['text', 'audio'],
+            instructions: 'You are a helpful assistant.',
+            voice: 'alloy',
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
+            input_audio_transcription: {
+              model: 'whisper-1',
+            },
+            turn_detection: {
+              type: 'server_vad',
+              threshold: 0.4,
+              prefix_padding_ms: 200,
+              silence_duration_ms: 400,
+              create_response: true,
+            },
+            temperature: 0.8,
+            max_response_output_tokens: 'inf',
+          },
+        }),
+      );
+    } else {
+      console.error('WebSocket is not open. Cannot send audio data.');
+    }
   });
 
-  // When receiving messages from OpenAI
   ws.on('message', (data: any) => {
     handleMessage(ws, data, audioPlayer);
   });
-  // When the WebSocket connection is closed
   ws.on('close', () => {
     console.log('Connection to OpenAI Realtime API closed');
   });
@@ -132,86 +212,72 @@ async function RealtimeWebsocket(voiceChannelConnection: VoiceConnection) {
 
 export default RealtimeWebsocket;
 
-// We'll keep some global or higher-scope variables:
+// Global variables for handling AI audio response streaming.
 let currentPassThrough: PassThrough | null = null;
 let currentResource: AudioResource | null = null;
 
-async function handleMessage(
-  ws: WebSocket,
-  messageStr: string,
-  audioPlayer: AudioPlayer,
-) {
+async function handleMessage(ws: WebSocket, messageStr: string, audioPlayer: AudioPlayer) {
   const message = JSON.parse(messageStr);
-  // Define what happens when a message is received
   switch (message.type) {
     case 'session.created':
       console.log('Connection to OpenAI has been established');
+      console.log(message);
       break;
-
+    case 'session.updated':
+      console.log('Session updated');
+      console.log(message);
+      break;
+    case 'converation.item.created':
+      console.log('Conversation item created');
+      console.log(message);
+      break;
+    case 'conversation.item.input_audio_transcription.completed':
+      console.log('Transcription completed');
+      console.log(message);
+      break;
     case 'input_audio_buffer.speech_started':
-      // Sent by the server when in server_vad mode to indicate that speech has been detected in the audio buffer. This can happen any time audio is added to the buffer (unless speech is already detected). The client may want to use this event to interrupt audio playback or provide visual feedback to the user.
       console.log('Ai has detected the user has started speaking');
       break;
-
     case 'input_audio_buffer.speech_stopped':
-      // Returned in server_vad mode when the server detects the end of speech in the audio buffer. The server will also send an conversation.item.created event with the user message item that is created from the audio buffer.
       console.log('Ai has detected the user has stopped speaking');
       break;
-
     case 'input_audio_buffer.committed':
-      // Returned when an input audio buffer is committed, either by the client or automatically in server VAD mode. The item_id property is the ID of the user message item that will be created, thus a conversation.item.created event will also be sent to the client.
       console.log('Ai has taken in the audio data');
       break;
-    
     case 'response.audio.delta': {
-      // If we don't have an active stream, create one now
       if (!currentPassThrough) {
         currentPassThrough = new PassThrough();
-
-        // Resample
         const resampledStream = resampleAudio(currentPassThrough);
-
-        // Create a new audio resource from the resampled stream
         currentResource = createAudioResource(resampledStream, {
           inputType: StreamType.Raw,
         });
-
-        // Start playing the new resource
         audioPlayer.play(currentResource);
 
         audioPlayer.on(AudioPlayerStatus.Playing, () => {
           console.log('Now playing AI voice (new response).');
         });
-
         audioPlayer.on('stateChange', (oldState, newState) => {
           console.log(`Audio player transitioned from ${oldState.status} to ${newState.status}`);
         });
       }
-
-      // Write the new chunk of data to the current PassThrough
       const base64AudioChunk = message.delta;
       const audioBuffer = Buffer.from(base64AudioChunk, 'base64');
       currentPassThrough.write(audioBuffer);
-
       break;
     }
-
-    // When the audio from this response is done
     case 'response.audio.done': {
       console.log('AI finished responding (audio).');
-      // End the current PassThrough if it exists
       if (currentPassThrough && !currentPassThrough.destroyed) {
         currentPassThrough.end();
       }
-      // Reset them to null so that the next response triggers new streams/resources
       currentPassThrough = null;
       currentResource = null;
       break;
     }
-
     case 'error':
       console.log('AI encountered an error:', message.error);
       ws.close();
       break;
   }
+  
 }
